@@ -1,0 +1,165 @@
+diff --git a/node_modules/bittorrent-protocol/index.js b/node_modules/bittorrent-protocol/index.js
+index 722878a..3724bd3 100644
+--- a/node_modules/bittorrent-protocol/index.js
++++ b/node_modules/bittorrent-protocol/index.js
+@@ -39,6 +39,8 @@ function xor (a, b) {
+   return a
+ }
+ 
++let _bittorrent_pe_ = null
++
+ class Request {
+   constructor (piece, offset, length, callback) {
+     this.piece = piece
+@@ -126,8 +128,21 @@ class Wire extends stream.Duplex {
+ 
+     this._peEnabled = peEnabled
+     if (peEnabled) {
+-      this._dh = crypto.createDiffieHellman(DH_PRIME, 'hex', DH_GENERATOR) // crypto object used to generate keys/secret
+-      this._myPubKey = this._dh.generateKeys('hex') // my DH public key
++      if (_bittorrent_pe_ && _bittorrent_pe_._dh && _bittorrent_pe_._myPubKey) {
++        this._dh = _bittorrent_pe_._dh
++        this._myPubKey = _bittorrent_pe_._myPubKey
++      } else {
++        try {
++          this._dh = crypto.createDiffieHellman(DH_PRIME, 'hex', DH_GENERATOR) // crypto object used to generate keys/secret
++        } catch (e) {
++          this._dh = crypto.createDiffieHellman(DH_PRIME, 'hex', DH_GENERATOR.toString())
++        }
++        this._myPubKey = this._dh.generateKeys('hex') // my DH public key
++        _bittorrent_pe_ = {
++          _dh: this._dh,
++          _myPubKey: this._myPubKey
++        }
++      }
+     } else {
+       this._myPubKey = null
+     }
+@@ -148,6 +163,7 @@ class Wire extends stream.Duplex {
+     this.on('finish', this._onFinish)
+     this._debug('type:', this.type)
+ 
++    // The incoming peer decryption causes app crash, skip it
+     if (this.type === 'tcpIncoming' && this._peEnabled) {
+       // If we are not the initiator, we should wait to see if the client begins
+       // with PE/MSE handshake or the standard bittorrent handshake.
+@@ -242,10 +258,11 @@ class Wire extends stream.Duplex {
+    */
+   keepAlive () {
+     this._debug('keep-alive')
+-    this._push(MESSAGE_KEEP_ALIVE)
++    // this._push(MESSAGE_KEEP_ALIVE)
+   }
+ 
+   sendPe1 () {
++    // console.log('sendPe1')
+     if (this._peEnabled) {
+       const padALen = Math.floor(Math.random() * 513)
+       const padA = randombytes(padALen)
+@@ -254,12 +271,14 @@ class Wire extends stream.Duplex {
+   }
+ 
+   sendPe2 () {
++    // console.log('sendPe2')
+     const padBLen = Math.floor(Math.random() * 513)
+     const padB = randombytes(padBLen)
+     this._push(Buffer.concat([Buffer.from(this._myPubKey, 'hex'), padB]))
+   }
+ 
+   sendPe3 (infoHash) {
++    // console.log('sendPe3')
+     this.setEncrypt(this._sharedSecret, infoHash)
+ 
+     const hash1Buffer = Buffer.from(sha1.sync(Buffer.from(this._utfToHex('req1') + this._sharedSecret, 'hex')), 'hex')
+@@ -284,6 +303,7 @@ class Wire extends stream.Duplex {
+   }
+ 
+   sendPe4 (infoHash) {
++    // console.log('sendPe4')
+     this.setEncrypt(this._sharedSecret, infoHash)
+ 
+     const padDLen = randombytes(2).readUInt16BE(0) % 512
+@@ -391,7 +411,8 @@ class Wire extends stream.Duplex {
+       // BEP6: If a peer sends a choke, it MUST reject all requests from the peer to whom the choke
+       // was sent except it SHOULD NOT reject requests for pieces that are in the allowed fast set.
+       while (this.peerRequests.length) {
+-        const request = this.peerRequests[0]
++        // Is this safety?
++        const request = this.peerRequests.pop()
+         if (!this.allowedFastSet.includes(request.piece)) {
+           this.reject(request.piece, request.offset, request.length)
+         }
+@@ -692,24 +713,29 @@ class Wire extends stream.Duplex {
+   }
+ 
+   _onPe1 (pubKeyBuffer) {
++    // console.log('onPe1')
+     this._peerPubKey = pubKeyBuffer.toString('hex')
+     this._sharedSecret = this._dh.computeSecret(this._peerPubKey, 'hex', 'hex')
+     this.emit('pe1')
+   }
+ 
+   _onPe2 (pubKeyBuffer) {
++    // console.log('onPe2')
+     this._peerPubKey = pubKeyBuffer.toString('hex')
+     this._sharedSecret = this._dh.computeSecret(this._peerPubKey, 'hex', 'hex')
+     this.emit('pe2')
+   }
+ 
+   _onPe3 (hashesXorBuffer) {
++    // console.log('bittorrent-protocol: onPe3')
+     const hash3 = sha1.sync(Buffer.from(this._utfToHex('req3') + this._sharedSecret, 'hex'))
+     const sKeyHash = xor(Buffer.from(hash3, 'hex'), hashesXorBuffer).toString('hex')
+     this.emit('pe3', sKeyHash)
++    // console.log('sKeyHash', sKeyHash)
+   }
+ 
+   _onPe3Encrypted (vcBuffer, peerProvideBuffer) {
++    // console.log('onPe3Enc')
+     if (!vcBuffer.equals(VC)) {
+       this._debug('Error: verification constant did not match')
+       this.destroy()
+@@ -730,6 +756,7 @@ class Wire extends stream.Duplex {
+   }
+ 
+   _onPe4 (peerSelectBuffer) {
++    // console.log('onPe4')
+     this._encryptionMethod = peerSelectBuffer.readUInt8(3)
+     if (!CRYPTO_PROVIDE.includes(this._encryptionMethod)) {
+       this._debug('Error: peer selected invalid crypto method')
+@@ -1156,10 +1183,16 @@ class Wire extends stream.Duplex {
+   }
+ 
+   _parsePe2 () {
+-    this._parse(96, pubKey => {
++    this._parse(96, async pubKey => {
+       this._onPe2(pubKey)
++      let trials = 0
+       while (!this._setGenerators) {
+         // Wait until generators have been set
++        await new Promise(resolve => setTimeout(resolve, 500))
++        trials++
++        if (trials > 5) {
++          return false
++        }
+       }
+       this._parsePe4()
+     })
+@@ -1170,10 +1203,16 @@ class Wire extends stream.Duplex {
+     const hash1Buffer = Buffer.from(sha1.sync(Buffer.from(this._utfToHex('req1') + this._sharedSecret, 'hex')), 'hex')
+     // synchronize on HASH('req1', S)
+     this._parseUntil(hash1Buffer, 512)
+-    this._parse(20, buffer => {
++    this._parse(20, async buffer => {
+       this._onPe3(buffer)
++      let trials = 0
+       while (!this._setGenerators) {
+         // Wait until generators have been set
++        await new Promise(resolve => setTimeout(resolve, 500))
++        trials++
++        if (trials > 5) {
++          return false
++        }
+       }
+       this._parsePe3Encrypted()
+     })
